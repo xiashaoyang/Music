@@ -3,7 +3,7 @@ import shuffle from 'lodash/shuffle';
 import { Howler, Howl } from 'howler';
 import { cacheTrackSource, getTrackSource } from '@/utils/db';
 import { getAlbum } from '@/api/album';
-import { getPlaylistDetail } from '@/api/playlist';
+import { getPlaylistDetail, intelligencePlaylist } from '@/api/playlist';
 import { getArtist } from '@/api/artist';
 import { personalFM, fmTrash } from '@/api/others';
 import store from '@/store';
@@ -14,6 +14,11 @@ const electron =
   process.env.IS_ELECTRON === true ? window.require('electron') : null;
 const ipcRenderer =
   process.env.IS_ELECTRON === true ? electron.ipcRenderer : null;
+const excludeSaveKeys = [
+  '_playing',
+  '_personalFMLoading',
+  '_personalFMNextLoading',
+];
 
 export default class {
   constructor() {
@@ -25,6 +30,8 @@ export default class {
     this._shuffle = false; // true | false
     this._volume = 1; // 0 to 1
     this._volumeBeforeMuted = 1; // 用于保存静音前的音量
+    this._personalFMLoading = false; // 是否正在私人FM中加载新的track
+    this._personalFMNextLoading = false; // 是否正在缓存私人FM的下一首歌曲
 
     // 播放信息
     this._list = []; // 播放列表
@@ -37,6 +44,14 @@ export default class {
     this._isPersonalFM = false; // 是否是私人FM模式
     this._personalFMTrack = { id: 0 }; // 私人FM当前歌曲
     this._personalFMNextTrack = { id: 0 }; // 私人FM下一首歌曲信息（为了快速加载下一首）
+
+    /**
+     * The blob records for cleanup.
+     *
+     * @private
+     * @type {string[]}
+     */
+    this.createdBlobRecords = [];
 
     // howler (https://github.com/goldfire/howler.js)
     this._howler = null;
@@ -154,7 +169,11 @@ export default class {
     this._setIntervals();
 
     // 初始化私人FM
-    if (this._personalFMTrack.id === 0 || this._personalFMNextTrack.id === 0) {
+    if (
+      this._personalFMTrack.id === 0 ||
+      this._personalFMNextTrack.id === 0 ||
+      this._personalFMTrack.id === this._personalFMNextTrack.id
+    ) {
       personalFM().then(result => {
         this._personalFMTrack = result.data[0];
         this._personalFMNextTrack = result.data[1];
@@ -247,7 +266,21 @@ export default class {
   _getAudioSourceFromCache(id) {
     return getTrackSource(id).then(t => {
       if (!t) return null;
+
+      // Create a new object URL.
       const source = URL.createObjectURL(new Blob([t.source]));
+
+      // Clean up the previous object URLs since we've created a new one.
+      // Revoke object URLs can release the memory taken by a Blob,
+      // which occupied a large proportion of memory.
+      for (const url in this.createdBlobRecords) {
+        URL.revokeObjectURL(url);
+      }
+
+      // Then, we replace the createBlobRecords with new one with
+      // our newly created object URL.
+      this.createdBlobRecords = [source];
+
       return source;
     });
   }
@@ -269,7 +302,7 @@ export default class {
       });
     }
   }
-  _getAudioSourceFromUnblockMusic(track) {
+  async _getAudioSourceFromUnblockMusic(track) {
     console.debug(`[debug][Player.js] _getAudioSourceFromUnblockMusic`);
     if (
       process.env.IS_ELECTRON !== true ||
@@ -277,7 +310,11 @@ export default class {
     ) {
       return null;
     }
-    const source = ipcRenderer.sendSync('unblock-music', track);
+    const source = await ipcRenderer.invoke(
+      'unblock-music',
+      track,
+      store.state.settings.unmSource
+    );
     if (store.state.settings.automaticallyCacheSongs && source?.url) {
       // TODO: 将unblockMusic字样换成真正的来源（比如酷我咪咕等）
       cacheTrackSource(track, source.url, 128000, 'unblockMusic');
@@ -312,16 +349,22 @@ export default class {
           return source;
         } else {
           store.dispatch('showToast', `无法播放 ${track.name}`);
-          ifUnplayableThen === 'playNextTrack'
-            ? this.playNextTrack()
-            : this.playPrevTrack();
+          if (ifUnplayableThen === 'playNextTrack') {
+            if (this.isPersonalFM) {
+              this.playNextFMTrack();
+            } else {
+              this.playNextTrack();
+            }
+          } else {
+            this.playPrevTrack();
+          }
         }
       });
     });
   }
   _cacheNextTrack() {
     let nextTrackID = this._isPersonalFM
-      ? this._personalFMNextTrack.id
+      ? this._personalFMNextTrack?.id ?? 0
       : this._getNextTrack()[0];
     if (!nextTrackID) return;
     if (this._personalFMTrack.id == nextTrackID) return;
@@ -349,7 +392,11 @@ export default class {
         this.playPrevTrack();
       });
       navigator.mediaSession.setActionHandler('nexttrack', () => {
-        this.playNextTrack();
+        if (this.isPersonalFM) {
+          this.playNextFMTrack();
+        } else {
+          this.playNextTrack();
+        }
       });
       navigator.mediaSession.setActionHandler('stop', () => {
         this.pause();
@@ -402,16 +449,33 @@ export default class {
     this._scrobble(this._currentTrack, 0, true);
     if (!this.isPersonalFM && this.repeatMode === 'one') {
       this._replaceCurrentTrack(this._currentTrack.id);
+    } else if (this.isPersonalFM) {
+      this.playNextFMTrack();
     } else {
       this.playNextTrack();
     }
   }
   _loadPersonalFMNextTrack() {
-    return personalFM().then(result => {
-      this._personalFMNextTrack = result.data[0];
-      this._cacheNextTrack(); // cache next track
-      return this._personalFMNextTrack;
-    });
+    if (this._personalFMNextLoading) {
+      return [false, undefined];
+    }
+    this._personalFMNextLoading = true;
+    return personalFM()
+      .then(result => {
+        if (!result || !result.data) {
+          this._personalFMNextTrack = undefined;
+        } else {
+          this._personalFMNextTrack = result.data[0];
+          this._cacheNextTrack(); // cache next track
+        }
+        this._personalFMNextLoading = false;
+        return [true, this._personalFMNextTrack];
+      })
+      .catch(() => {
+        this._personalFMNextTrack = undefined;
+        this._personalFMNextLoading = false;
+        return [false, this._personalFMNextTrack];
+      });
   }
   _playDiscordPresence(track, seekTime = 0) {
     if (
@@ -441,14 +505,7 @@ export default class {
   appendTrack(trackID) {
     this.list.append(trackID);
   }
-  playNextTrack(isFM = false) {
-    if (this._isPersonalFM || isFM === true) {
-      this._isPersonalFM = true;
-      this._personalFMTrack = this._personalFMNextTrack;
-      this._replaceCurrentTrack(this._personalFMTrack.id);
-      this._loadPersonalFMNextTrack();
-      return true;
-    }
+  playNextTrack() {
     // TODO: 切换歌曲时增加加载中的状态
     const [trackID, index] = this._getNextTrack();
     if (trackID === undefined) {
@@ -458,6 +515,34 @@ export default class {
     }
     this.current = index;
     this._replaceCurrentTrack(trackID);
+    return true;
+  }
+  async playNextFMTrack() {
+    if (this._personalFMLoading) {
+      return false;
+    }
+
+    this._isPersonalFM = true;
+    if (!this._personalFMNextTrack) {
+      this._personalFMLoading = true;
+      let result = await personalFM().catch(() => null);
+      this._personalFMLoading = false;
+      if (!result || !result.data) {
+        store.dispatch('showToast', 'personal fm timeout');
+        return false;
+      }
+      // 这里只能拿到一条数据
+      this._personalFMTrack = result.data[0];
+    } else {
+      if (this._personalFMNextTrack.id === this._personalFMTrack.id) {
+        return false;
+      }
+      this._personalFMTrack = this._personalFMNextTrack;
+    }
+    if (this._isPersonalFM) {
+      this._replaceCurrentTrack(this._personalFMTrack.id);
+    }
+    this._loadPersonalFMNextTrack();
     return true;
   }
   playPrevTrack() {
@@ -470,7 +555,7 @@ export default class {
   saveSelfToLocalStorage() {
     let player = {};
     for (let [key, value] of Object.entries(this)) {
-      if (key === '_playing') continue;
+      if (excludeSaveKeys.includes(key)) continue;
       player[key] = value;
     }
 
@@ -580,9 +665,27 @@ export default class {
     }
     this._replaceCurrentTrack(id);
   }
+  playIntelligenceListById(id, trackID = 'first', noCache = false) {
+    getPlaylistDetail(id, noCache).then(data => {
+      const randomId = Math.floor(
+        Math.random() * (data.playlist.trackIds.length + 1)
+      );
+      const songId = data.playlist.trackIds[randomId].id;
+      intelligencePlaylist({ id: songId, pid: id }).then(result => {
+        let trackIDs = result.data.map(t => t.id);
+        this.replacePlaylist(trackIDs, id, 'playlist', trackID);
+      });
+    });
+  }
   addTrackToPlayNext(trackID, playNow = false) {
     this._playNextList.push(trackID);
-    if (playNow) this.playNextTrack();
+    if (playNow) {
+      if (this.isPersonalFM) {
+        this.playNextFMTrack();
+      } else {
+        this.playNextTrack();
+      }
+    }
   }
   playPersonalFM() {
     this._isPersonalFM = true;
@@ -595,10 +698,12 @@ export default class {
       this.playOrPause();
     }
   }
-  moveToFMTrash() {
+  async moveToFMTrash() {
     this._isPersonalFM = true;
-    this.playNextTrack();
-    fmTrash(this._personalFMTrack.id);
+    let id = this._personalFMTrack.id;
+    if (await this.playNextFMTrack()) {
+      fmTrash(id);
+    }
   }
 
   sendSelfToIpcMain() {
