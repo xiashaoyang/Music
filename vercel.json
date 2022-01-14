@@ -2,7 +2,7 @@
   "rewrites": [
     {
       "source": "/api/:match*",
-      "destination": "https://netease-music-api.fe-mm.com/:match*"
+      "destination": "https://api.music.imsyy.top/:match*"
     }
   ]
 }
